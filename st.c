@@ -2304,7 +2304,7 @@ sdlinit(void) {
 
 	//dc.font = dc.ifont = dc.bfont = dc.ibfont = NULL;
 
-	if(SDL_Init(SDL_INIT_VIDEO) == -1) {
+	if(SDL_Init(SDL_INIT_EVERYTHING) == -1) {
 		fprintf(stderr,"Unable to initialize SDL: %s\n", SDL_GetError());
 		exit(EXIT_FAILURE);
 	}
@@ -2352,7 +2352,7 @@ sdlinit(void) {
 #ifdef RS97_SCREEN_480
 	if(!(screen = SDL_SetVideoMode(320, 480, 16, SDL_SWSURFACE | SDL_DOUBLEBUF))) {
 #else
-	if(!(screen = SDL_SetVideoMode(320, 240, 16, SDL_HWSURFACE | SDL_DOUBLEBUF))) {
+	if(!(screen = SDL_SetVideoMode(480, 320, 16, SDL_HWSURFACE | SDL_DOUBLEBUF))) {
 #endif
 		fprintf(stderr,"Unable to set video mode: %s\n", SDL_GetError());
 		exit(EXIT_FAILURE);
@@ -2740,7 +2740,7 @@ cresize(int width, int height)
 #ifdef RS97_SCREEN_480
 	if(!(screen = SDL_SetVideoMode(320, 480, 16, SDL_SWSURFACE | SDL_DOUBLEBUF))) {
 #else
-	if(!(screen = SDL_SetVideoMode(320, 240, 16, SDL_HWSURFACE | SDL_DOUBLEBUF))) {
+	if(!(screen = SDL_SetVideoMode(480, 320, 16, SDL_HWSURFACE | SDL_DOUBLEBUF))) {
 #endif
 		fprintf(stderr,"Unable to set video mode: %s\n", SDL_GetError());
 		exit(EXIT_FAILURE);
