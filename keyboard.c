@@ -318,8 +318,8 @@ int handle_keyboard_event(SDL_Event* event) {
 
 int main() {
 	SDL_Init( SDL_INIT_EVERYTHING );
-	SDL_Surface* screen = SDL_SetVideoMode(320 * 4, 240 * 4, 16, SDL_SWSURFACE );
-	SDL_Surface* buffer = SDL_CreateRGBSurface(SDL_SWSURFACE, 320, 240, 16, screen->format->Rmask, screen->format->Gmask, screen->format->Bmask, screen->format->Amask);
+	SDL_Surface* screen = SDL_SetVideoMode(480 * 4, 320 * 4, 16, SDL_SWSURFACE );
+	SDL_Surface* buffer = SDL_CreateRGBSurface(SDL_SWSURFACE, 480, 320, 16, screen->format->Rmask, screen->format->Gmask, screen->format->Bmask, screen->format->Amask);
 	while(1) {
 		SDL_Event event;
 		while( SDL_PollEvent( &event ) ) {
