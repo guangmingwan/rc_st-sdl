@@ -4,7 +4,31 @@
 #define NUM_ROWS 6
 #define NUM_KEYS 18
 
-//#ifdef RS97
+/* PC and D8 have a full physical keyboard and share the same mapping */
+#if defined(PC) || defined(D8)
+#define FULL_KEYBOARD
+#endif
+
+#ifdef FULL_KEYBOARD
+
+#define KEY_UP SDLK_UP
+#define KEY_DOWN SDLK_DOWN
+#define KEY_LEFT SDLK_LEFT
+#define KEY_RIGHT SDLK_RIGHT
+#define KEY_ENTER SDLK_RETURN
+#define KEY_TOGGLE SDLK_SPACE
+#define KEY_BACKSPACE SDLK_b
+#define KEY_LOCATION SDLK_l
+#define KEY_FONT SDLK_f
+#define KEY_QUIT SDLK_ESCAPE
+#define KEY_HELP SDLK_F1
+
+/* the real shift keys on the physical keyboard */
+static int is_shift_key(SDLKey sym) {
+	return sym == SDLK_LSHIFT || sym == SDLK_RSHIFT;
+}
+
+#else
 
 #define KEY_UP SDLK_UP
 #define KEY_DOWN SDLK_DOWN
@@ -15,24 +39,14 @@
 #define KEY_BACKSPACE SDLK_BACKSPACE // R
 #define KEY_SHIFT SDLK_TAB // L
 #define KEY_LOCATION SDLK_LSHIFT // Y
-#define KEY_ACTIVATE SDLK_SPACE // X
 #define KEY_QUIT SDLK_ESCAPE // SELECT
 #define KEY_HELP SDLK_RETURN // START
 
-/*#else
+static int is_shift_key(SDLKey sym) {
+	return sym == KEY_SHIFT;
+}
 
-#define KEY_UP SDLK_UP
-#define KEY_DOWN SDLK_DOWN
-#define KEY_LEFT SDLK_LEFT
-#define KEY_RIGHT SDLK_RIGHT
-#define KEY_ENTER SDLK_RETURN
-#define KEY_TOGGLE SDLK_SPACE
-#define KEY_BACKSPACE SDLK_b
-#define KEY_SHIFT SDLK_s
-#define KEY_LOCATION SDLK_l
-#define KEY_ACTIVATE SDLK_BACKQUOTE
-
-#endif*/
+#endif
 
 #define KMOD_SYNTHETIC (1 << 13)
 
@@ -82,6 +96,9 @@ static int location = 0;
 static int active = 1;
 static int mod_state = 0;
 static int show_help = 1;
+static int shift_down = 0;  /* physical shift key held */
+static int shift_used = 0;  /* another key pressed while shift held (uppercase/symbol input) */
+static int shift_applied = 0; /* we set the virtual shifted state on keydown */
 
 void init_keyboard() {
 	for(int j = 0; j < NUM_ROWS; j++)
@@ -90,20 +107,42 @@ void init_keyboard() {
 	selected_i = selected_j = shifted = location = 0;
 	active = 1;
 	mod_state = 0;
+	shift_down = shift_used = shift_applied = 0;
 
 }
 
-char* help = 
-"How to use:\n"
-"  ARROWS: select key from keyboard\n"
-"  A: press key\n"
-"  B: toggle key (useful for shift/ctrl...)\n"
-"  L: shift\n"
-"  R: backspace\n"
-"  Y: change keyboard location (top/bottom)\n"
-"  X: show / hide keyboard\n"
-"  SELECT: quit\n"
-"  START: show this help\n\n"
+#ifdef FULL_KEYBOARD
+#define HELP_TEXT \
+"How to use:\n" \
+"  ARROWS: select key from keyboard\n" \
+"  ENTER: press key\n" \
+"  SPACE: toggle key (useful for shift/ctrl...)\n" \
+"  SHIFT: hold + key: uppercase/symbol (Shift+A = A, Shift+1 = !)\n" \
+"     tap SHIFT alone: show / hide keyboard\n" \
+"  B: backspace\n" \
+"  L: change keyboard location (top/bottom)\n" \
+"  SHIFT + L: switch terminal/UI font\n" \
+"  F: switch terminal/UI font\n" \
+"  ESC: quit\n" \
+"  F1: show this help\n"
+#else
+#define HELP_TEXT \
+"How to use:\n" \
+"  ARROWS: select key from keyboard\n" \
+"  A: press key\n" \
+"  B: toggle key (useful for shift/ctrl...)\n" \
+"  L: hold + key: uppercase/symbol (L+A = A, L+1 = !)\n" \
+"     tap L alone: show / hide keyboard\n" \
+"  R: backspace\n" \
+"  Y: change keyboard location (top/bottom)\n" \
+"  L + Y: switch terminal/UI font\n" \
+"  SELECT: quit\n" \
+"  START: show this help\n"
+#endif
+
+char* help =
+HELP_TEXT
+"\n"
 "Cheatcheet (tutorial at www.shellscript.sh):\n"
 "  TAB key         complete path\n"
 "  UP/DOWN keys    navigate history\n"
@@ -130,8 +169,8 @@ void draw_keyboard(SDL_Surface* surface) {
 	unsigned short toggled_color = SDL_MapRGB(surface->format, 192, 192, 0);
 	if(show_help) {
 		SDL_FillRect(surface, NULL, bg_color);
-		draw_string(surface, "SDL Terminal by Benob, based on st-sdl", 42, 10, sel_toggled_color);
-		draw_string(surface, help, 8, 28, sel_color);
+		draw_string_ex(surface, "SDL Terminal by Benob, based on st-sdl", 42, 10, sel_toggled_color, get_display_font());
+		draw_string_ex(surface, help, 8, 28, sel_color, get_display_font());
 		return;
 	}
 	if(!active) return;
@@ -250,10 +289,42 @@ int compute_new_col(int visual_offset, int old_row, int new_row) {
 
 int handle_keyboard_event(SDL_Event* event) {
 	static int visual_offset = 0;
-	if(event->key.type == SDL_KEYDOWN && !(event->key.keysym.mod & KMOD_SYNTHETIC) && event->key.keysym.sym == KEY_ACTIVATE) {
-		active = ! active;
-		return 1;
+	/* physical shift key: hold + press key = shifted input (uppercase/symbol),
+	   tap alone = show / hide keyboard */
+	if(!(event->key.keysym.mod & KMOD_SYNTHETIC) && is_shift_key(event->key.keysym.sym)) {
+		if(event->key.type == SDL_KEYDOWN) {
+			if(!shift_down) {
+				shift_down = 1;
+				shift_used = 0;
+				shift_applied = 0;
+				if(active && !show_help) {
+					shift_applied = 1;
+					shifted = 1;
+					toggled[4][0] = 1;
+					update_modstate(SDLK_LSHIFT, STATE_DOWN);
+				}
+			}
+			return 1; /* consume key repeat too */
+		}
+		if(event->key.type == SDL_KEYUP && shift_down) {
+			shift_down = 0;
+			if(shift_applied) {
+				shift_applied = 0;
+				shifted = 0;
+				toggled[4][0] = 0;
+				update_modstate(SDLK_LSHIFT, STATE_UP);
+			}
+			if(show_help)
+				show_help = 0;
+			else if(!shift_used)
+				active = !active;
+			return 1;
+		}
 	}
+	/* any other key pressed while shift is held means it was used for input
+	   (repeated shift keydowns from key repeat don't count) */
+	if(!(event->key.keysym.mod & KMOD_SYNTHETIC) && event->key.type == SDL_KEYDOWN && shift_down && !is_shift_key(event->key.keysym.sym))
+		shift_used = 1;
 	if(!active) return 0;
 	if((event->key.type == SDL_KEYUP || event->key.type == SDL_KEYDOWN) && event->key.keysym.mod & KMOD_SYNTHETIC) return 0;
 
@@ -278,12 +349,15 @@ int handle_keyboard_event(SDL_Event* event) {
 		} else if(event->key.keysym.sym == KEY_RIGHT && selected_i < row_length[selected_j] - 1) {
 			selected_i++;
 			visual_offset = compute_visual_offset(selected_i, selected_j);
-		} else if(event->key.keysym.sym == KEY_SHIFT) {
-			shifted = 1;
-			toggled[4][0] = 1;
-			update_modstate(SDLK_LSHIFT, STATE_DOWN);
 		} else if(event->key.keysym.sym == KEY_LOCATION) {
-			location = !location;
+			if(mod_state & KMOD_SHIFT)
+				toggle_display_font();
+			else
+				location = !location;
+#ifdef FULL_KEYBOARD
+		} else if(event->key.keysym.sym == KEY_FONT) {
+			toggle_display_font();
+#endif
 		} else if(event->key.keysym.sym == KEY_BACKSPACE) {
 			simulate_key(SDLK_BACKSPACE, STATE_TYPED);
 		} else if(event->key.keysym.sym == KEY_TOGGLE) {
@@ -305,10 +379,6 @@ int handle_keyboard_event(SDL_Event* event) {
 	} else if(event->key.type == SDL_KEYUP || event->key.state == SDL_RELEASED) {
 		if(show_help) {
 			show_help = 0;
-		} else if(event->key.keysym.sym == KEY_SHIFT) {
-			shifted = 0;
-			toggled[4][0] = 0;
-			update_modstate(SDLK_LSHIFT, STATE_UP);
 		}
 	}
 	return 1;

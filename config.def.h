@@ -12,6 +12,12 @@ static int borderpx = 2;
 #ifdef RETROCARNIVAL
 static int initial_width = 480;
 static int initial_height = 320;
+#elif defined(D8)
+static int initial_width = 480;
+static int initial_height = 272;
+#elif defined(PC)
+static int initial_width = 800;
+static int initial_height = 600;
 #else
 static int initial_width = 320;
 static int initial_height = 240;

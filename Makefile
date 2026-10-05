@@ -12,6 +12,7 @@ libst-preload.so: st-preload.o msg_queue.o
 	${CC} -shared -o $@ $^
 
 sdl_test: sdl_test.o
+	${CC} -o $@ $< ${LDFLAGS}
 
 options:
 	@echo st build options:
@@ -34,7 +35,7 @@ st: ${OBJ}
 
 clean:
 	@echo cleaning
-	@rm -f st ${OBJ} st-${VERSION}.tar.gz
+	@rm -f st ${OBJ} st-preload.o sdl_test.o libst-preload.so sdl_test st-${VERSION}.tar.gz
 
 dist: clean
 	@echo creating dist tarball

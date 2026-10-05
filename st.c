@@ -15,6 +15,8 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/mount.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -1108,14 +1110,132 @@ void sigchld(int a)
 	}
 }
 
+static void ensure_pty(void)
+{
+	struct stat st;
+	FILE *f;
+	char line[256];
+	int devpts_mounted = 0;
+
+	/* is devpts already mounted on /dev/pts? */
+	if ((f = fopen("/proc/mounts", "r")))
+	{
+		while (fgets(line, sizeof line, f))
+		{
+			char dev[64], mnt[64], fstype[32];
+
+			if (sscanf(line, "%63s %63s %31s", dev, mnt, fstype) == 3
+			    && !strcmp(fstype, "devpts") && !strcmp(mnt, "/dev/pts"))
+			{
+				devpts_mounted = 1;
+				break;
+			}
+		}
+		fclose(f);
+	}
+
+	mkdir("/dev/pts", 0755);
+
+	if (!devpts_mounted && mount("devpts", "/dev/pts", "devpts", 0, NULL) == 0)
+	{
+		fprintf(stderr, "devpts mounted.\n");
+		devpts_mounted = 1;
+	}
+	else if (!devpts_mounted)
+		fprintf(stderr, "devpts mount failed: %s\n", strerror(errno));
+
+	if (stat("/dev/ptmx", &st) < 0)
+	{
+		if (mknod("/dev/ptmx", S_IFCHR | 0666, makedev(5, 2)) == 0)
+			fprintf(stderr, "/dev/ptmx created.\n");
+		else
+			fprintf(stderr, "/dev/ptmx mknod failed: %s\n", strerror(errno));
+	}
+
+	/* no devpts: static node for the first unix98 pty (like the old build) */
+	if (!devpts_mounted && stat("/dev/pts/0", &st) < 0)
+	{
+		if (mknod("/dev/pts/0", S_IFCHR | 0666, makedev(136, 0)) == 0)
+			fprintf(stderr, "/dev/pts/0 created successfully.\n");
+		else if (errno != EEXIST)
+			fprintf(stderr, "/dev/pts/0 mknod failed: %s\n", strerror(errno));
+	}
+}
+
+static int open_pty_pair(int *pm, int *ps, struct winsize *w)
+{
+	int mfd, sfd, idx = 0, unlock = 0;
+	char path[64];
+
+	if (openpty(pm, ps, NULL, NULL, w) == 0)
+		return 0;
+
+	/* fallback for systems where devpts is not mounted and /dev is read-only:
+	   open ptmx ourselves and create the slave node where we can */
+	mfd = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+	if (mfd < 0)
+		return -1;
+	if (ioctl(mfd, TIOCGPTN, &idx) < 0)
+	{
+		close(mfd);
+		return -1;
+	}
+	ioctl(mfd, TIOCSPTLCK, &unlock);
+
+	snprintf(path, sizeof path, "/dev/pts/%d", idx);
+	sfd = open(path, O_RDWR | O_NOCTTY);
+	if (sfd < 0)
+	{
+		snprintf(path, sizeof path, "/tmp/.st_pts%d", idx);
+		unlink(path);
+		if (mknod(path, S_IFCHR | 0666, makedev(136, idx)) < 0)
+		{
+			close(mfd);
+			return -1;
+		}
+		sfd = open(path, O_RDWR | O_NOCTTY);
+		unlink(path);
+		if (sfd < 0)
+		{
+			close(mfd);
+			return -1;
+		}
+		fprintf(stderr, "st: pty%d slave via /tmp node\n", idx);
+	}
+	if (w)
+		ioctl(sfd, TIOCSWINSZ, w);
+	*pm = mfd;
+	*ps = sfd;
+	return 0;
+}
+
 void ttynew(void)
 {
 	int m, s;
 	struct winsize w = {term.row, term.col, 0, 0};
 
+	ensure_pty();
+
 	/* seems to work fine on linux, openbsd and freebsd */
-	if (openpty(&m, &s, NULL, NULL, &w) < 0)
-		die("openpty failed: %s\n", SERRNO);
+	if (open_pty_pair(&m, &s, &w) < 0)
+	{
+		struct stat st;
+
+		fprintf(stderr, "openpty failed: %s (euid=%d)\n", strerror(errno), geteuid());
+		if (stat("/dev/ptmx", &st) < 0)
+			fprintf(stderr, "  /dev/ptmx stat failed: %s\n", strerror(errno));
+		else
+			fprintf(stderr, "  /dev/ptmx ok: %d:%d mode %o\n",
+				major(st.st_rdev), minor(st.st_rdev), st.st_mode & 0777);
+		if (stat("/dev/pts", &st) < 0)
+			fprintf(stderr, "  /dev/pts stat failed: %s\n", strerror(errno));
+		if (stat("/dev/pts/0", &st) < 0)
+			fprintf(stderr, "  /dev/pts/0 stat failed: %s\n", strerror(errno));
+		else
+			fprintf(stderr, "  /dev/pts/0 ok: %d:%d mode %o\n",
+				major(st.st_rdev), minor(st.st_rdev), st.st_mode & 0777);
+		die("");
+	}
 
 	switch (pid = fork())
 	{
@@ -1158,6 +1278,8 @@ void dump(char c)
 		fprintf(stderr, "\n");
 }
 
+static volatile int shellexited = 0;
+
 void ttyread(void)
 {
 	static char buf[BUFSIZ];
@@ -1169,8 +1291,12 @@ void ttyread(void)
 	int ret;
 
 	/* append read bytes to unprocessed bytes */
-	if ((ret = read(cmdfd, buf + buflen, LEN(buf) - buflen)) < 0)
-		die("Couldn't read from shell: %s\n", SERRNO);
+	ret = read(cmdfd, buf + buflen, LEN(buf) - buflen);
+	if (ret <= 0) {
+		/* shell exited (pty EIO/EOF): let the main thread quit cleanly */
+		shellexited = 1;
+		return;
+	}
 
 	/* process every complete utf8 char */
 	buflen += ret;
@@ -2506,8 +2632,8 @@ void sdlloadfonts(char *fontstr, int fontsize)
 	dc.font = TTF_OpenFont(fontstr, fontsize);
     fprintf(stderr, "%s\n", fontstr);*/
 	//TTF_SizeUTF8(dc.font, "O", &xw.cw, &xw.ch);
-	xw.cw = 6;
-	xw.ch = 8;
+	xw.cw = font_char_width(get_display_font());
+	xw.ch = font_line_height(get_display_font());
 
 	/*if(dc.ifont) TTF_CloseFont(dc.ifont);
 	dc.ifont = TTF_OpenFont(fontstr, fontsize);
@@ -2637,6 +2763,10 @@ void sdlinit(void)
 #ifdef RS97_SCREEN_480
 	if (!(screen = SDL_SetVideoMode(320, 480, 16, SDL_SWSURFACE | SDL_DOUBLEBUF)))
 	{
+#elif defined(D8)
+	if(!(screen = SDL_SetVideoMode(480, 272, 16, SDL_HWSURFACE | SDL_DOUBLEBUF))) {
+#elif defined(PC)
+	if(!(screen = SDL_SetVideoMode(800, 600, 16, SDL_SWSURFACE))) {
 #else
 	if(!(screen = SDL_SetVideoMode(480, 320, 16, SDL_HWSURFACE | SDL_DOUBLEBUF))) {
 #endif
@@ -2770,7 +2900,7 @@ void xdraws(char *s, Glyph base, int x, int y, int charlen, int bytelen)
 		}*/
 		int xs = r.x;
 		if (xw.win != NULL)
-			draw_string(xw.win, s, xs, r.y, SDL_MapRGB(xw.win->format, fg->r, fg->g, fg->b));
+			draw_string_ex(xw.win, s, xs, r.y, SDL_MapRGB(xw.win->format, fg->r, fg->g, fg->b), get_display_font());
 
 		/*while(*s) {
             draw_char(xw.win, *s, xs, r.y, SDL_MapRGB(xw.win->format, fg->r, fg->g, fg->b));
@@ -3157,6 +3287,10 @@ void cresize(int width, int height)
 #ifdef RS97_SCREEN_480
 	if (!(screen = SDL_SetVideoMode(320, 480, 16, SDL_SWSURFACE | SDL_DOUBLEBUF)))
 	{
+#elif defined(D8)
+	if(!(screen = SDL_SetVideoMode(480, 272, 16, SDL_HWSURFACE | SDL_DOUBLEBUF))) {
+#elif defined(PC)
+	if(!(screen = SDL_SetVideoMode(800, 600, 16, SDL_SWSURFACE))) {
 #else
 	if(!(screen = SDL_SetVideoMode(480, 320, 16, SDL_HWSURFACE | SDL_DOUBLEBUF))) {
 #endif
@@ -3194,6 +3328,14 @@ int ttythread(void *unused)
 
 	for (i = 0;; i++)
 	{
+		if (shellexited) {
+			SDL_Event quit;
+
+			quit.type = SDL_QUIT;
+			SDL_PushEvent(&quit);
+			SDL_Delay(200);
+			continue;
+		}
 		FD_ZERO(&rfd);
 		FD_SET(cmdfd, &rfd);
 		if (select(cmdfd + 1, &rfd, NULL, NULL, tv) < 0)
@@ -3236,6 +3378,7 @@ void run(void)
 {
 	queue_t qid = queue_create();
 	SDL_Event ev;
+	int last_font = get_display_font();
 
 	while (SDL_WaitEvent(&ev))
 	{
@@ -3270,6 +3413,15 @@ void run(void)
 		{
 			if (handle_keyboard_event(&ev))
 			{
+				int font = get_display_font();
+				if (font != last_font)
+				{
+					last_font = font;
+					xw.cw = font_char_width(font);
+					xw.ch = font_line_height(font);
+					cresize(0, 0);
+					draw();
+				}
 				/*SDL_Event expose_event = {
                     .type = SDL_VIDEOEXPOSE
                 };
@@ -3373,7 +3525,8 @@ int main(int argc, char *argv[])
 
 run:
 	setlocale(LC_CTYPE, "");
-	tnew((initial_width - 2) / 6, (initial_height - 2) / 8);
+	tnew((initial_width - 2 * borderpx) / font_char_width(get_display_font()),
+		 (initial_height - 2 * borderpx) / font_line_height(get_display_font()));
 	ttynew();
 	sdlinit(); /* Must have TTY before cresize */
 	init_keyboard();
