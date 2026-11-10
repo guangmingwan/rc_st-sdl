@@ -1,4 +1,7 @@
 #include <SDL/SDL.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "font.h"
 #include "console_font.h"
 
@@ -16,7 +19,8 @@ void draw_char(SDL_Surface* surface, unsigned char symbol, int x, int y, unsigne
 
 	for(int i = 0, ys = 0; i < 6; i++, ptr++, ys += 1)
 		for(int col = 8 - 6, xs = x - col; col < 8; col++, xs -= 1)
-			if((*ptr & 1 << col) && y + ys < surface->h && xs < surface->w )
+			if((*ptr & 1 << col) && y + flip * 4 + (1 - 2 * flip) * ys >= 0 &&
+			   y + flip * 4 + (1 - 2 * flip) * ys < surface->h && xs >= 0 && xs < surface->w)
                 ((unsigned short*)surface->pixels)[(y + flip * 4 + (1 - 2 * flip) * ys) * (surface->pitch >> 1) + xs] = color;
 
 }
@@ -37,42 +41,188 @@ void draw_string(SDL_Surface* surface, const char* text, int orig_x, int orig_y,
 
 /* font used for terminal and UI text; keyboard keys always use embedded_font */
 static int display_font = FONT_CONSOLE;
+static unsigned char *unicode_bitmap;
+static unsigned char *unicode_glyph_width;
+
+/* Independent of the firmware's optional libc locale/wcwidth tables. */
+int unicode_width(unsigned long u) {
+	return u >= 0x1100 &&
+		(u <= 0x115f || u == 0x2329 || u == 0x232a ||
+		 (u >= 0x2e80 && u <= 0xa4cf && u != 0x303f) ||
+		 (u >= 0xac00 && u <= 0xd7a3) ||
+		 (u >= 0xf900 && u <= 0xfaff) ||
+		 (u >= 0xfe10 && u <= 0xfe19) ||
+		 (u >= 0xfe30 && u <= 0xfe6f) ||
+		 (u >= 0xff01 && u <= 0xff60) ||
+		 (u >= 0xffe0 && u <= 0xffe6) ||
+		 (u >= 0x1f300 && u <= 0x1faff) ||
+		 (u >= 0x20000 && u <= 0x3fffd)) ? 2 : 1;
+}
+
+static int hex_digit(unsigned char c) {
+	if(c >= '0' && c <= '9') return c - '0';
+	if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+	if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+	return -1;
+}
+
+/* GNU Unifont .hex: BMP code point followed by 16 rows, 8 or 16 bits/row. */
+int load_unicode_font(const char* path) {
+	FILE *fp = fopen(path, "r");
+	unsigned char *bitmap, *widths;
+	char line[256];
+	int count = 0;
+	if(!fp) return 0;
+	bitmap = calloc(65536, 32);
+	widths = calloc(65536, 1);
+	if(!bitmap || !widths) goto invalid;
+	while(fgets(line, sizeof(line), fp)) {
+		char *colon = strchr(line, ':'), *end;
+		unsigned long u;
+		size_t len;
+		int i;
+		unsigned char glyph[32] = {0};
+		if(!colon || colon - line != 4) goto invalid;
+		for(i = 0; i < 4; i++)
+			if(hex_digit(line[i]) < 0) goto invalid;
+		u = strtoul(line, &end, 16);
+		if(end != colon || u > 0xffff) goto invalid;
+		len = strcspn(colon + 1, "\r\n");
+		if(len != 32 && len != 64) goto invalid;
+		for(i = 0; i < (int)len / 2; i++) {
+			int hi = hex_digit(colon[1 + i * 2]);
+			int lo = hex_digit(colon[2 + i * 2]);
+			if(hi < 0 || lo < 0) goto invalid;
+			glyph[i] = (hi << 4) | lo;
+		}
+		memcpy(bitmap + u * 32, glyph, 32);
+		widths[u] = len == 32 ? 8 : 16;
+		count++;
+	}
+	if(ferror(fp) || !count) goto invalid;
+	fclose(fp);
+	free(unicode_bitmap);
+	free(unicode_glyph_width);
+	unicode_bitmap = bitmap;
+	unicode_glyph_width = widths;
+	set_display_font(FONT_UNICODE);
+	return 1;
+invalid:
+	fclose(fp);
+	free(bitmap);
+	free(widths);
+	return 0;
+}
+
+/* Decode a bounded string; consume one byte for malformed/truncated UTF-8. */
+static size_t decode_utf8(const char *s, size_t len, unsigned long *u) {
+	const unsigned char *p = (const unsigned char *)s;
+	unsigned long value;
+	size_t n, i;
+	if(p[0] < 0x80) { *u = p[0]; return 1; }
+	if(p[0] >= 0xc2 && p[0] <= 0xdf) { n = 2; value = p[0] & 0x1f; }
+	else if(p[0] >= 0xe0 && p[0] <= 0xef) { n = 3; value = p[0] & 0x0f; }
+	else if(p[0] >= 0xf0 && p[0] <= 0xf4) { n = 4; value = p[0] & 7; }
+	else goto invalid;
+	if(n > len) goto invalid;
+	for(i = 1; i < n; i++) {
+		if((p[i] & 0xc0) != 0x80) goto invalid;
+		value = (value << 6) | (p[i] & 0x3f);
+	}
+	if((n == 3 && value < 0x800) || (n == 4 && value < 0x10000) ||
+	   (value >= 0xd800 && value <= 0xdfff) || value > 0x10ffff) goto invalid;
+	*u = value;
+	return n;
+invalid:
+	*u = 0xfffd;
+	return 1;
+}
+
+static void draw_unicode(SDL_Surface *surface, unsigned long u, int x, int y,
+		unsigned short color, int font) {
+	int w = unicode_width(u) * font_char_width(font);
+	int h = font_line_height(font), xs, ys;
+	int source_width = u <= 0xffff && unicode_glyph_width ? unicode_glyph_width[u] : 0;
+	const unsigned char *glyph = source_width ? unicode_bitmap + u * 32 : NULL;
+	for(ys = 0; ys < h; ys++) {
+		int py = y + ys;
+		if(py < 0 || py >= surface->h) continue;
+		for(xs = 0; xs < w; xs++) {
+			int px = x + xs, ink;
+			if(px < 0 || px >= surface->w) continue;
+			if(glyph) {
+				int sx = xs * source_width / w, sy = ys * 16 / h;
+				ink = glyph[sy * (source_width / 8) + sx / 8] & (0x80 >> (sx % 8));
+			} else {
+				/* Visible missing-glyph box, retaining the character's column width. */
+				ink = xs > 0 && xs < w - 1 && ys > 0 && ys < h - 1 &&
+					(xs == 1 || xs == w - 2 || ys == 1 || ys == h - 2);
+			}
+			if(ink) ((unsigned short *)surface->pixels)[py * (surface->pitch >> 1) + px] = color;
+		}
+	}
+}
+
+int font_text_width(const char *text, int font) {
+	size_t length = strlen(text);
+	int width = 0;
+	while(length) {
+		unsigned long u;
+		size_t n = decode_utf8(text, length, &u);
+		width += unicode_width(u) * font_char_width(font);
+		text += n;
+		length -= n;
+	}
+	return width;
+}
 
 void draw_char_console(SDL_Surface* surface, unsigned char symbol, int x, int y, unsigned short color) {
 	const unsigned char* ptr = console_font_6x11 + symbol * 11;
 	for(int ys = 0; ys < 11; ys++, ptr++)
 		for(int xs = 0; xs < 6; xs++)
-			if((*ptr & 0x80 >> xs) && y + ys < surface->h && x + xs < surface->w)
+			if((*ptr & 0x80 >> xs) && y + ys >= 0 && y + ys < surface->h && x + xs >= 0 && x + xs < surface->w)
 				((unsigned short*)surface->pixels)[(y + ys) * (surface->pitch >> 1) + x + xs] = color;
 }
 
 void draw_char_ex(SDL_Surface* surface, unsigned char symbol, int x, int y, unsigned short color, int font) {
-	if(font == FONT_CONSOLE)
+	if(font == FONT_UNICODE)
+		draw_unicode(surface, symbol, x, y, color, font);
+	else if(font == FONT_CONSOLE)
 		draw_char_console(surface, symbol, x, y, color);
 	else
 		draw_char(surface, symbol, x, y, color);
 }
 
 void draw_string_ex(SDL_Surface* surface, const char* text, int orig_x, int orig_y, unsigned short color, int font) {
+	draw_text_ex(surface, text, strlen(text), orig_x, orig_y, color, font);
+}
+
+void draw_text_ex(SDL_Surface* surface, const char* text, size_t length, int orig_x, int orig_y, unsigned short color, int font) {
 	int x = orig_x, y = orig_y;
-	while(*text) {
-		if(*text == '\n') {
+	while(length) {
+		unsigned long u;
+		size_t n = decode_utf8(text, length, &u);
+		if(u == '\n') {
 			x = orig_x;
 			y += font_line_height(font);
 		} else {
-			draw_char_ex(surface, *text, x, y, color, font);
-			x += font_char_width(font);
+			if(u >= 0x80 || font == FONT_UNICODE)
+				draw_unicode(surface, u, x, y, color, font);
+			else
+				draw_char_ex(surface, u, x, y, color, font);
+			x += unicode_width(u) * font_char_width(font);
 		}
-		text++;
+		text += n;
+		length -= n;
 	}
 }
 
 int font_char_width(int font) {
-	return font == FONT_CONSOLE ? 6 : 6;
+	return font == FONT_UNICODE ? 8 : 6;
 }
 
 int font_line_height(int font) {
-	return font == FONT_CONSOLE ? 11 : 8;
+	return font == FONT_UNICODE ? 16 : font == FONT_CONSOLE ? 11 : 8;
 }
 
 void set_display_font(int font) {
@@ -84,5 +234,7 @@ int get_display_font(void) {
 }
 
 void toggle_display_font(void) {
-	display_font = (display_font == FONT_CONSOLE) ? FONT_EMBEDDED : FONT_CONSOLE;
+	if(display_font == FONT_UNICODE) display_font = FONT_CONSOLE;
+	else if(display_font == FONT_CONSOLE) display_font = FONT_EMBEDDED;
+	else display_font = unicode_bitmap ? FONT_UNICODE : FONT_CONSOLE;
 }

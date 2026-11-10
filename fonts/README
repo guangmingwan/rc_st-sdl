@@ -1,0 +1,7 @@
+Run python3 tools/prepare_font.py on the build machine to populate this directory
+with GNU Unifont and its upstream copyright/license notices. Copy this entire
+directory beside the st executable on the handheld. No network is needed there.
+
+The terminal also accepts -f /path/to/unifont.hex or ST_FONT=/path/to/unifont.hex.
+The supported format is an uncompressed BMP Unifont .hex file with 8x16/16x16
+glyphs. TTF, TTC, GBK/HZK binary fonts and .hex.gz are not read by the terminal.

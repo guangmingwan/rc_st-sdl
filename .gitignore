@@ -1,0 +1,16 @@
+/.build/
+/dist/
+/config.h
+/st
+/sdl_test
+/libst-preload.so
+/*.o
+/fonts/unifont.hex
+/fonts/OFL-1.1.txt
+/fonts/COPYING
+/fonts/FONT-NOTICE.txt
+/fonts/README.upstream
+/ime-data/dict_pinyin.dat
+/ime-data/LICENSE-2.0.txt
+/ime-data/NOTICE.txt
+/ime-data/user.dat

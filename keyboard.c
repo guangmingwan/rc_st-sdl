@@ -1,5 +1,6 @@
 #include <SDL/SDL.h>
 #include "font.h"
+#include "ime.h"
 
 #define NUM_ROWS 6
 #define NUM_KEYS 18
@@ -52,6 +53,7 @@ static int is_shift_key(SDLKey sym) {
 
 static int row_length[NUM_ROWS] = {13, 17, 17, 15, 14, 8};
 
+#ifndef FULL_KEYBOARD
 static SDLKey keys[2][NUM_ROWS][NUM_KEYS] = {
 	{
 		{SDLK_ESCAPE, SDLK_F1, SDLK_F2, SDLK_F3, SDLK_F4, SDLK_F5, SDLK_F6, SDLK_F8, SDLK_F9, SDLK_F10, SDLK_F11, SDLK_F12},
@@ -69,6 +71,8 @@ static SDLKey keys[2][NUM_ROWS][NUM_KEYS] = {
 		{SDLK_LCTRL, SDLK_LSUPER, SDLK_LALT, SDLK_SPACE, SDLK_RALT, SDLK_RSUPER, SDLK_MENU, SDLK_RCTRL}
 	}
 };
+
+#endif
 
 static char* syms[2][NUM_ROWS][NUM_KEYS] = {
 	{
@@ -99,6 +103,10 @@ static int show_help = 1;
 static int shift_down = 0;  /* physical shift key held */
 static int shift_used = 0;  /* another key pressed while shift held (uppercase/symbol input) */
 static int shift_applied = 0; /* we set the virtual shifted state on keydown */
+#ifdef FULL_KEYBOARD
+static unsigned int physical_shifts;
+static int physical_shift_used;
+#endif
 
 void init_keyboard() {
 	for(int j = 0; j < NUM_ROWS; j++)
@@ -108,6 +116,12 @@ void init_keyboard() {
 	active = 1;
 	mod_state = 0;
 	shift_down = shift_used = shift_applied = 0;
+#ifdef FULL_KEYBOARD
+	active = 0;
+	show_help = 1;
+	physical_shifts = 0;
+	physical_shift_used = 0;
+#endif
 
 }
 
@@ -140,25 +154,36 @@ void init_keyboard() {
 "  START: show this help\n"
 #endif
 
+#ifdef FULL_KEYBOARD
 char* help =
-HELP_TEXT
+"How to use (physical keyboard):\n"
+" SHIFT tap / Ctrl+Space: Chinese/English\n"
+" SHIFT+key: uppercase/symbol   F1: this help\n"
+" F or Ctrl+Alt+F: switch font   ESC: to program\n"
+"Pinyin: a-z; ' or v separates syllables\n"
+" SPACE/1-5: choose   -/=: page   ESC: cancel\n"
 "\n"
-"Cheatcheet (tutorial at www.shellscript.sh):\n"
-"  TAB key         complete path\n"
-"  UP/DOWN keys    navigate history\n"
-"  pwd             print current directory\n"
-"  ls              list files (-l for file size)\n"
-"  cd <d>          change directory (.. = go up)\n"
-"  cp <f> <d>      copy files (dest can be dir)\n"
-"  mv <f> <d>      move files (dest can be dir)\n"
-"  rm <f>          remove files (use -rf for dir)\n"
-"  top             see running processes (q to quit)\n"
-"  more <f>        see content of text file\n"
-"  file <f>        see type of file\n"
-"  opkg install <f.ipk>  install package\n"
-"  opkg remove <f>       remove package\n"
-"  grep <pattern> <f>    find in files\n"
+"Cheatsheet:\n"
+" TAB: complete path   UP/DOWN: history\n"
+" pwd | ls -l | cd <d> | cp/mv <f> <d> | rm [-rf] <f>\n"
+" top | more <f> | file <f> | grep <pat> <f>\n"
+" opkg install/remove <pkg>\n"
 ;
+#else
+char* help =
+"How to use:\n"
+" ARROWS: select   ENTER: press   SPACE: toggle (shift/ctrl)\n"
+" SHIFT+key: upper/symbol  |  SHIFT alone: show/hide kbd\n"
+" F: switch font   L: kbd top/bottom   B: backspace\n"
+" ESC: quit   F1: help\n"
+"\n"
+"Cheatsheet:\n"
+" TAB: complete path   UP/DOWN: history\n"
+" pwd | ls -l | cd <d> | cp/mv <f> <d> | rm [-rf] <f>\n"
+" top | more <f> | file <f> | grep <pat> <f>\n"
+" opkg install/remove <pkg>\n"
+;
+#endif
 
 void draw_keyboard(SDL_Surface* surface) {
 	unsigned short bg_color = SDL_MapRGB(surface->format, 64, 64, 64);
@@ -288,6 +313,43 @@ int compute_new_col(int visual_offset, int old_row, int new_row) {
 }
 
 int handle_keyboard_event(SDL_Event* event) {
+#ifdef FULL_KEYBOARD
+	/* Full keyboards type directly. Shift is an IME toggle only when tapped. */
+	SDLKey key = event->key.keysym.sym;
+	if (event->key.keysym.mod & KMOD_SYNTHETIC) return 0;
+	if (key == SDLK_F1) {
+		if (event->type == SDL_KEYDOWN) show_help = !show_help;
+		return 1;
+	}
+	if (show_help) {
+		if (event->type == SDL_KEYUP) show_help = 0;
+		return 1;
+	}
+	if (is_shift_key(key)) {
+		unsigned int bit = key == SDLK_LSHIFT ? 1 : 2;
+		if (event->type == SDL_KEYDOWN) {
+			if (!physical_shifts) {
+				physical_shift_used = (event->key.keysym.mod & (KMOD_CTRL | KMOD_ALT | KMOD_META)) != 0;
+				int count = 0;
+				Uint8 *held = SDL_GetKeyState(&count);
+				for (int i = 0; i < count; i++)
+					if (held[i] && i != SDLK_LSHIFT && i != SDLK_RSHIFT) physical_shift_used = 1;
+			}
+			physical_shifts |= bit;
+		} else if (event->type == SDL_KEYUP && (physical_shifts & bit)) {
+			physical_shifts &= ~bit;
+			if (!physical_shifts && !physical_shift_used) ime_toggle();
+		}
+		return 1;
+	}
+	if (event->type == SDL_KEYDOWN && physical_shifts) physical_shift_used = 1;
+	if (event->type == SDL_KEYDOWN && key == SDLK_f &&
+		(event->key.keysym.mod & KMOD_CTRL) && (event->key.keysym.mod & KMOD_ALT)) {
+		toggle_display_font();
+		return 1;
+	}
+	return 0;
+#else
 	static int visual_offset = 0;
 	/* physical shift key: hold + press key = shifted input (uppercase/symbol),
 	   tap alone = show / hide keyboard */
@@ -382,6 +444,7 @@ int handle_keyboard_event(SDL_Event* event) {
 		}
 	}
 	return 1;
+#endif
 }
 
 #ifdef TEST_KEYBOARD

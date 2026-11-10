@@ -21,6 +21,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <termios.h>
 #include <unistd.h>
 #include <libgen.h>
 
@@ -29,6 +30,7 @@
 //#include <SDL/SDL_ttf.h>
 
 #include "font.h"
+#include "ime.h"
 #include "keyboard.h"
 #include "msg_queue.h"
 
@@ -47,7 +49,7 @@
 
 #define USAGE                                                     \
 	"st " VERSION " (c) 2010-2012 st engineers\n"                 \
-	"usage: st [-v] [-c class] [-f font] [-g geometry] [-o file]" \
+	"usage: st [-v] [-c class] [-f unifont.hex] [-g geometry] [-o file]" \
 	" [-t title] [-e command ...]\n"
 
 /* Arbitrary sizes */
@@ -71,7 +73,7 @@
 #define DEFAULT(a, b) (a) = (a) ? (a) : (b)
 #define BETWEEN(x, a, b) ((a) <= (x) && (x) <= (b))
 #define LIMIT(x, a, b) (x) = (x) < (a) ? (a) : (x) > (b) ? (b) : (x)
-#define ATTRCMP(a, b) ((a).mode != (b).mode || (a).fg != (b).fg || (a).bg != (b).bg)
+#define ATTRCMP(a, b) (((a).mode & ~(ATTR_WIDE | ATTR_WDUMMY)) != ((b).mode & ~(ATTR_WIDE | ATTR_WDUMMY)) || (a).fg != (b).fg || (a).bg != (b).bg)
 #define IS_SET(flag) (term.mode & (flag))
 #define TIMEDIFF(t1, t2) ((t1.tv_sec - t2.tv_sec) * 1000 + (t1.tv_usec - t2.tv_usec) / 1000)
 
@@ -89,6 +91,8 @@ enum glyph_attribute
 	ATTR_GFX = 8,
 	ATTR_ITALIC = 16,
 	ATTR_BLINK = 32,
+	ATTR_WIDE = 64,
+	ATTR_WDUMMY = 128,
 };
 
 enum cursor_movement
@@ -478,6 +482,7 @@ void xflip(void)
 	SDL_Surface *buffer = SDL_CreateRGBSurface(SDL_SWSURFACE, xw.w, xw.h, 16, screen->format->Rmask, screen->format->Gmask, screen->format->Bmask, screen->format->Amask);
 	SDL_BlitSurface(xw.win, NULL, buffer, NULL);
 	draw_keyboard(buffer);
+	ime_draw(buffer, borderpx + term.c.x * xw.cw, borderpx + term.c.y * xw.ch, xw.ch);
 
 	SDL_LockSurface(buffer);
 	SDL_LockSurface(screen);
@@ -495,6 +500,7 @@ void xflip(void)
 #else
 	SDL_BlitSurface(xw.win, NULL, screen, NULL);
 	draw_keyboard(screen);
+	ime_draw(screen, borderpx + term.c.x * xw.cw, borderpx + term.c.y * xw.ch, xw.ch);
 #endif
 
 	if (SDL_Flip(screen))
@@ -552,7 +558,7 @@ int utf8decode(char *s, long *u)
 	if ((n == 1 && *u < 0x80) ||
 		(n == 2 && *u < 0x800) ||
 		(n == 3 && *u < 0x10000) ||
-		(*u >= 0xD800 && *u <= 0xDFFF))
+		(*u >= 0xD800 && *u <= 0xDFFF) || *u > 0x10FFFF)
 	{
 		goto invalid;
 	}
@@ -820,6 +826,8 @@ void selcopy(void)
 			for (x = 0; gp <= last; x++, ++gp)
 			{
 				if (!(is_selected = selected(x, y)))
+					continue;
+				if ((gp->state & GLYPH_SET) && (gp->mode & ATTR_WDUMMY))
 					continue;
 
 				p = (gp->state & GLYPH_SET) ? gp->c : " ";
@@ -1237,6 +1245,14 @@ void ttynew(void)
 		die("");
 	}
 
+	/* UTF-8 erase in the kernel line discipline for programs using cooked input. */
+#ifdef IUTF8
+	struct termios tty_attributes;
+	if (tcgetattr(s, &tty_attributes) == 0) {
+		tty_attributes.c_iflag |= IUTF8;
+		tcsetattr(s, TCSANOW, &tty_attributes);
+	}
+#endif
 	switch (pid = fork())
 	{
 	case -1:
@@ -1304,8 +1320,8 @@ void ttyread(void)
 	while (buflen >= UTF_SIZ || isfullutf8(ptr, buflen))
 	{
 		charsize = utf8decode(ptr, &utf8c);
-		utf8encode(&utf8c, s);
-		tputc(s, charsize);
+		memset(s, 0, sizeof(s));
+		tputc(s, utf8encode(&utf8c, s));
 		ptr += charsize;
 		buflen -= charsize;
 	}
@@ -1396,8 +1412,8 @@ void tnew(int col, int row)
 
 	for (row = 0; row < term.row; row++)
 	{
-		term.line[row] = xmalloc(term.col * sizeof(Glyph));
-		term.alt[row] = xmalloc(term.col * sizeof(Glyph));
+		term.line[row] = xcalloc(term.col, sizeof(Glyph));
+		term.alt[row] = xcalloc(term.col, sizeof(Glyph));
 		term.dirty[row] = 0;
 	}
 	memset(term.tabs, 0, term.col * sizeof(*term.tabs));
@@ -1565,14 +1581,17 @@ void tsetchar(char *c, Glyph *attr, int x, int y)
 	}
 
 	term.dirty[y] = 1;
+	tclearregion(x, y, x, y);
 	term.line[y][x] = *attr;
-	memcpy(term.line[y][x].c, c, UTF_SIZ);
+	term.line[y][x].mode &= ~(ATTR_WIDE | ATTR_WDUMMY);
+	memset(term.line[y][x].c, 0, UTF_SIZ);
+	memcpy(term.line[y][x].c, c, utf8size(c));
 	term.line[y][x].state |= GLYPH_SET;
 }
 
 void tclearregion(int x1, int y1, int x2, int y2)
 {
-	int x, y, temp;
+	int x, y, temp, start, end;
 
 	if (x1 > x2)
 		temp = x1, x1 = x2, x2 = temp;
@@ -1587,13 +1606,40 @@ void tclearregion(int x1, int y1, int x2, int y2)
 	for (y = y1; y <= y2; y++)
 	{
 		term.dirty[y] = 1;
-		for (x = x1; x <= x2; x++)
+		start = x1;
+		end = x2;
+		if ((term.line[y][start].state & GLYPH_SET) &&
+			(term.line[y][start].mode & ATTR_WDUMMY) && start > 0)
+			--start;
+		if ((term.line[y][end].state & GLYPH_SET) &&
+			(term.line[y][end].mode & ATTR_WIDE) && end + 1 < term.col)
+			++end;
+		for (x = start; x <= end; x++) {
 			term.line[y][x].state = 0;
+			term.line[y][x].mode = 0;
+		}
+	}
+}
+
+/* Column edits/resizes can cut a wide character in half. Drop orphan halves. */
+static void tfixwide(Line line, int col)
+{
+	int x;
+	for (x = 0; x < col; x++) {
+		if (!(line[x].state & GLYPH_SET)) continue;
+		if (((line[x].mode & ATTR_WIDE) &&
+			 (x + 1 == col || !(line[x + 1].state & GLYPH_SET) || !(line[x + 1].mode & ATTR_WDUMMY))) ||
+			((line[x].mode & ATTR_WDUMMY) &&
+			 (x == 0 || !(line[x - 1].state & GLYPH_SET) || !(line[x - 1].mode & ATTR_WIDE)))) {
+			line[x].state = 0;
+			line[x].mode = 0;
+		}
 	}
 }
 
 void tdeletechar(int n)
 {
+	LIMIT(n, 0, term.col - term.c.x);
 	int src = term.c.x + n;
 	int dst = term.c.x;
 	int size = term.col - src;
@@ -1608,11 +1654,13 @@ void tdeletechar(int n)
 
 	memmove(&term.line[term.c.y][dst], &term.line[term.c.y][src],
 			size * sizeof(Glyph));
-	tclearregion(term.col - n, term.c.y, term.col - 1, term.c.y);
+	memset(&term.line[term.c.y][term.col - n], 0, n * sizeof(Glyph));
+	tfixwide(term.line[term.c.y], term.col);
 }
 
 void tinsertblank(int n)
 {
+	LIMIT(n, 0, term.col - term.c.x);
 	int src = term.c.x;
 	int dst = src + n;
 	int size = term.col - dst;
@@ -1627,7 +1675,8 @@ void tinsertblank(int n)
 
 	memmove(&term.line[term.c.y][dst], &term.line[term.c.y][src],
 			size * sizeof(Glyph));
-	tclearregion(src, term.c.y, dst - 1, term.c.y);
+	memset(&term.line[term.c.y][src], 0, n * sizeof(Glyph));
+	tfixwide(term.line[term.c.y], term.col);
 }
 
 void tinsertblankline(int n)
@@ -2217,6 +2266,8 @@ void tputc(char *c, int len)
 {
 	uchar ascii = *c;
 	bool control = ascii < '\x20' || ascii == 0177;
+	long codepoint;
+	int width;
 
 	if (iofd != -1)
 	{
@@ -2462,13 +2513,34 @@ void tputc(char *c, int len)
 		return;
 	if (sel.bx != -1 && BETWEEN(term.c.y, sel.by, sel.ey))
 		sel.bx = -1;
+	utf8decode(c, &codepoint);
+	width = unicode_width(codepoint);
+	if (width > term.col) {
+		c = "\xef\xbf\xbd";
+		width = 1;
+	}
 	if (IS_SET(MODE_WRAP) && term.c.state & CURSOR_WRAPNEXT)
 		tnewline(1); /* always go to first col */
+	if (term.c.x + width > term.col) {
+		if (IS_SET(MODE_WRAP)) tnewline(1);
+		else tmoveto(term.col - width, term.c.y);
+	}
+	if (IS_SET(MODE_INSERT)) tinsertblank(width);
+	tclearregion(term.c.x, term.c.y, term.c.x + width - 1, term.c.y);
 	tsetchar(c, &term.c.attr, term.c.x, term.c.y);
-	if (term.c.x + 1 < term.col)
-		tmoveto(term.c.x + 1, term.c.y);
-	else
+	if (width == 2) {
+		term.line[term.c.y][term.c.x].mode |= ATTR_WIDE;
+		term.line[term.c.y][term.c.x + 1] = term.c.attr;
+		memset(term.line[term.c.y][term.c.x + 1].c, 0, UTF_SIZ);
+		term.line[term.c.y][term.c.x + 1].mode |= ATTR_WDUMMY;
+		term.line[term.c.y][term.c.x + 1].state = GLYPH_SET;
+	}
+	if (term.c.x + width < term.col)
+		tmoveto(term.c.x + width, term.c.y);
+	else {
+		term.c.x = term.col - 1;
 		term.c.state |= CURSOR_WRAPNEXT;
+	}
 }
 
 int tresize(int col, int row)
@@ -2520,6 +2592,8 @@ int tresize(int col, int row)
 			term.line[i][x].state = 0;
 			term.alt[i][x].state = 0;
 		}
+		tfixwide(term.line[i], col);
+		tfixwide(term.alt[i], col);
 	}
 
 	/* allocate any new rows */
@@ -2801,8 +2875,6 @@ void xdraws(char *s, Glyph base, int x, int y, int charlen, int bytelen)
 	SDL_Color *fg = &dc.colors[base.fg], *bg = &dc.colors[base.bg],
 			  *temp, revfg, revbg;
 
-	s[bytelen] = '\0';
-
 	if (base.mode & ATTR_BOLD)
 	{
 		if (BETWEEN(base.fg, 0, 7))
@@ -2900,7 +2972,7 @@ void xdraws(char *s, Glyph base, int x, int y, int charlen, int bytelen)
 		}*/
 		int xs = r.x;
 		if (xw.win != NULL)
-			draw_string_ex(xw.win, s, xs, r.y, SDL_MapRGB(xw.win->format, fg->r, fg->g, fg->b), get_display_font());
+			draw_text_ex(xw.win, s, bytelen, xs, r.y, SDL_MapRGB(xw.win->format, fg->r, fg->g, fg->b), get_display_font());
 
 		/*while(*s) {
             draw_char(xw.win, *s, xs, r.y, SDL_MapRGB(xw.win->format, fg->r, fg->g, fg->b));
@@ -2922,21 +2994,28 @@ void xdraws(char *s, Glyph base, int x, int y, int charlen, int bytelen)
 void xdrawcursor(void)
 {
 	static int oldx = 0, oldy = 0;
-	int sl;
+	int sl, cx = term.c.x, width;
 	Glyph g = {{' '}, ATTR_NULL, defaultbg, defaultcs, 0};
 
 	LIMIT(oldx, 0, term.col - 1);
 	LIMIT(oldy, 0, term.row - 1);
 
-	if (term.line[term.c.y][term.c.x].state & GLYPH_SET)
-		memcpy(g.c, term.line[term.c.y][term.c.x].c, UTF_SIZ);
+	if ((term.line[term.c.y][cx].state & GLYPH_SET) &&
+		(term.line[term.c.y][cx].mode & ATTR_WDUMMY) && cx > 0)
+		--cx;
+	if (term.line[term.c.y][cx].state & GLYPH_SET) {
+		memcpy(g.c, term.line[term.c.y][cx].c, UTF_SIZ);
+		g.mode |= term.line[term.c.y][cx].mode & ATTR_WIDE;
+	}
 
 	/* remove the old cursor */
 	if (term.line[oldy][oldx].state & GLYPH_SET)
 	{
+		if ((term.line[oldy][oldx].mode & ATTR_WDUMMY) && oldx > 0) --oldx;
 		sl = utf8size(term.line[oldy][oldx].c);
+		width = term.line[oldy][oldx].mode & ATTR_WIDE ? 2 : 1;
 		xdraws(term.line[oldy][oldx].c, term.line[oldy][oldx], oldx,
-			   oldy, 1, sl);
+			   oldy, width, sl);
 	}
 	else
 	{
@@ -2953,8 +3032,8 @@ void xdrawcursor(void)
 			g.mode |= ATTR_REVERSE, g.fg = defaultcs, g.bg = defaultfg;
 
 		sl = utf8size(g.c);
-		xdraws(g.c, g, term.c.x, term.c.y, 1, sl);
-		oldx = term.c.x, oldy = term.c.y;
+		xdraws(g.c, g, cx, term.c.y, g.mode & ATTR_WIDE ? 2 : 1, sl);
+		oldx = cx, oldy = term.c.y;
 	}
 }
 
@@ -3002,7 +3081,9 @@ void drawregion(int x1, int y1, int x2, int y2)
 		for (x = x1; x < x2; x++)
 		{
 			new = term.line[y][x];
-			if (ena_sel && *(new.c) && selected(x, y))
+			if ((new.state & GLYPH_SET) && (new.mode & ATTR_WDUMMY)) continue;
+			if (ena_sel && *(new.c) && (selected(x, y) ||
+				((new.mode & ATTR_WIDE) && selected(x + 1, y))))
 				new.mode ^= ATTR_REVERSE;
 			if (ib > 0 && (!(new.state &GLYPH_SET) || ATTRCMP(base, new) || ib >= DRAW_BUF_SIZ - UTF_SIZ))
 			{
@@ -3019,7 +3100,7 @@ void drawregion(int x1, int y1, int x2, int y2)
 				sl = utf8size(new.c);
 				memcpy(buf + ib, new.c, sl);
 				ib += sl;
-				++ic;
+				ic += new.mode & ATTR_WIDE ? 2 : 1;
 			}
 		}
 		if (ib > 0)
@@ -3105,7 +3186,7 @@ kmap(SDLKey k, SDLMod state)
 }
 void jbpress(SDL_Event *ev)
 {
-	SDL_Event sdlevent;
+	SDL_Event sdlevent = {0};
 	switch (ev->type)
 	{
 		case SDL_JOYBUTTONDOWN:
@@ -3190,7 +3271,7 @@ void jhmotion(SDL_Event *ev)
 		break;
 	}
 
-	SDL_Event sdlevent;
+	SDL_Event sdlevent = {0};
 	sdlevent.type = (ev->jhat.value == 0 ? SDL_KEYUP : SDL_KEYDOWN);
 	sdlevent.key.keysym.sym = jh_value;
 
@@ -3205,6 +3286,7 @@ void kpress(SDL_Event *ev)
 
 	if (IS_SET(MODE_KBDLOCK))
 		return;
+	if (ime_handle_key(e, ttywrite)) return;
 
 	meta = e->keysym.mod & KMOD_ALT;
 	shift = e->keysym.mod & KMOD_SHIFT;
@@ -3514,20 +3596,45 @@ int main(int argc, char *argv[])
 		}
 	}
 
+run:
+	;
+	/* Resolve resources from the executable, including when launched with -e. */
+	char path[PATH_MAX], fontpath[PATH_MAX + 32];
+	const char *fontfile = opt_font ? opt_font : getenv("ST_FONT");
+	ssize_t pathlen = readlink("/proc/self/exe", path, sizeof(path) - 1);
+	if (pathlen >= 0) path[pathlen] = '\0';
+	else if (!realpath(argv[0], path)) strcpy(path, "./st");
+	char *directory = dirname(path);
+	snprintf(preload_libname, sizeof(preload_libname), "%s/libst-preload.so", directory);
+	if (fontfile) {
+		if (!load_unicode_font(fontfile)) die("Unable to load Unifont .hex font: %s\n", fontfile);
+	} else {
+		snprintf(fontpath, sizeof(fontpath), "%s/fonts/unifont.hex", directory);
+		if (!load_unicode_font(fontpath) && !load_unicode_font("/usr/share/unifont/unifont.hex"))
+			fprintf(stderr, "Chinese font not found; put unifont.hex in fonts/ beside st or set ST_FONT.\n");
+	}
 	if (atexit(sdlshutdown))
 	{
 		fprintf(stderr, "Unable to register SDL_Quit atexit\n");
 	}
 
-	char path[PATH_MAX];
-	realpath(dirname(argv[0]), path);
-	snprintf(preload_libname, PATH_MAX + 17, "%s/libst-preload.so", path);
-
-run:
 	setlocale(LC_CTYPE, "");
 	tnew((initial_width - 2 * borderpx) / font_char_width(get_display_font()),
 		 (initial_height - 2 * borderpx) / font_line_height(get_display_font()));
 	ttynew();
+	char dictionary[PATH_MAX + 64], user_dictionary[PATH_MAX + 64];
+	const char *configured_dictionary = getenv("ST_IME_DICT");
+	const char *configured_user = getenv("ST_IME_USER");
+#ifdef PC
+	snprintf(dictionary, sizeof(dictionary), "%s/.build/pc/dict_pinyin.dat", directory);
+#else
+	snprintf(dictionary, sizeof(dictionary), "%s/ime-data/dict_pinyin.dat", directory);
+#endif
+	snprintf(user_dictionary, sizeof(user_dictionary), "%s/ime-data/user.dat", directory);
+	if (!ime_init(configured_dictionary ? configured_dictionary : dictionary,
+		configured_user ? configured_user : user_dictionary))
+		fprintf(stderr, "Pinyin dictionary unavailable: %s\n", configured_dictionary ? configured_dictionary : dictionary);
+	atexit(ime_shutdown);
 	sdlinit(); /* Must have TTY before cresize */
 	init_keyboard();
 	selinit();

@@ -7,6 +7,17 @@ Modified to run on RS-97.
 => TTF fonts replaced by embedded pixel font (from TIC-80)
 => onscreen keyboard (see keyboard.c for button bindings)
 
+Chinese / RetroFW D88
+---------------------
+UTF-8 Chinese output is supported with an external GNU Unifont bitmap.
+On full physical keyboards, a help page is shown at startup; any key dismisses
+it and F1 toggles it again. Tap Shift for an offline Pinyin candidate window;
+Shift chords retain uppercase/symbol input. Selected Chinese is sent as UTF-8
+to the PTY for shell, Vim and other terminal applications.
+Run `make package-d8` to fetch the font, cross-compile with the RetroFW SDK,
+and prepare .build/d88/ for copying to the handheld. See README.zh-CN.md for
+deployment, font selection, encoding requirements and verification commands.
+
 Keys: 
 - pad: select key
 - A: press key

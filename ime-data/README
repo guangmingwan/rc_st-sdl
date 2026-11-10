@@ -1,0 +1,7 @@
+Run python3 tools/prepare_ime.py to prepare the pinned 32-bit little-endian
+Android PinyinIME system dictionary, decoder source and Apache 2.0 notices.
+
+Deploy dict_pinyin.dat, LICENSE-2.0.txt and NOTICE.txt beside each other in
+ime-data/ next to st. The terminal creates user.dat here for learned words;
+preserve that file during upgrades. ST_IME_DICT and ST_IME_USER can override
+these paths. Desktop 64-bit development dictionaries have a different ABI.
